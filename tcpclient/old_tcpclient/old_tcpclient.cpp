@@ -1,5 +1,5 @@
 #define _CRT_SECURE_NO_WARNINGS
-#define _WINSOCK_DEPRECATED_NO_WARNINGS
+
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <winsock2.h>
@@ -25,6 +25,10 @@ int sock_err(const char* function, int s) {
     err = WSAGetLastError();
     fprintf(stderr, "%s: socket error: %d\n", function, err);
     return -1;
+}
+
+void s_close(int s) {
+    closesocket(s);
 }
 
 int main(int argc, char* argv[]) {
@@ -55,47 +59,51 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(atoi(port));
-    addr.sin_addr.s_addr = inet_addr(host);
+    // Resolve host
+    struct addrinfo hints, * res;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    if (getaddrinfo(host, port, &hints, &res) != 0) {
+        fprintf(stderr, "getaddrinfo failed\n");
+        s_close(my_socket);
+        deinit();
+        return 1;
+    }
 
     // Connect with retries
     int attempts = 0;
     while (attempts < 10) {
-        if (connect(my_socket, (struct sockaddr*)&addr, sizeof(addr)) == 0) {
-            fprintf(stderr, "Failed to connect\n");
-            // Send initial "put" message
-            const char* init_msg = "put";
-            if (send(my_socket, init_msg, 3, 0) < 0) {
-                fprintf(stderr, "Failed to send initial message\n");
-                closesocket(my_socket);
-                deinit();
-                return 1;
-            }
-            else {
-                printf("PUT sent successfully\n");
-            }
+        if (connect(my_socket, res->ai_addr, res->ai_addrlen) == 0) {
+            break;
         }
-        else {
-            attempts++;
-            Sleep(100);
-            printf("Trying to reconnect (%d)\n", attempts);
-        }
+        attempts++;
+        Sleep(100);
     }
     if (attempts == 10) {
         fprintf(stderr, "Failed to connect after 10 attempts\n");
-        closesocket(my_socket);
+        freeaddrinfo(res);
+        s_close(my_socket);
         deinit();
         return 1;
     }
-//_____________________________________
+    freeaddrinfo(res);
+
     // Open file
     FILE* file = fopen(argv[2], "r");
     if (!file) {
         fprintf(stderr, "Failed to open file %s\n", argv[2]);
-        closesocket(my_socket);
+        s_close(my_socket);
+        deinit();
+        return 1;
+    }
+
+    // Send initial "put" message
+    const char* init_msg = "put";
+    if (send(my_socket, init_msg, 3, 0) < 0) {
+        fprintf(stderr, "Failed to send initial message\n");
+        fclose(file);
+        s_close(my_socket);
         deinit();
         return 1;
     }
@@ -131,7 +139,7 @@ int main(int argc, char* argv[]) {
         if (send(my_socket, (const char*)&msg_num, 4, 0) < 0) {
             fprintf(stderr, "Failed to send message number\n");
             fclose(file);
-            closesocket(my_socket);
+            s_close(my_socket);
             deinit();
             return 1;
         }
@@ -142,7 +150,7 @@ int main(int argc, char* argv[]) {
             send(my_socket, (const char*)&year_net, 2, 0) < 0) {
             fprintf(stderr, "Failed to send date\n");
             fclose(file);
-            closesocket(my_socket);
+            s_close(my_socket);
             deinit();
             return 1;
         }
@@ -151,7 +159,7 @@ int main(int argc, char* argv[]) {
         if (send(my_socket, (const char*)&aa_net, 2, 0) < 0) {
             fprintf(stderr, "Failed to send AA\n");
             fclose(file);
-            closesocket(my_socket);
+            s_close(my_socket);
             deinit();
             return 1;
         }
@@ -160,7 +168,7 @@ int main(int argc, char* argv[]) {
         if (send(my_socket, phone, 12, 0) < 0) {
             fprintf(stderr, "Failed to send phone\n");
             fclose(file);
-            closesocket(my_socket);
+            s_close(my_socket);
             deinit();
             return 1;
         }
@@ -170,7 +178,7 @@ int main(int argc, char* argv[]) {
         if (send(my_socket, message, msg_len, 0) < 0 || send(my_socket, "\0", 1, 0) < 0) {
             fprintf(stderr, "Failed to send message\n");
             fclose(file);
-            closesocket(my_socket);
+            s_close(my_socket);
             deinit();
             return 1;
         }
@@ -185,14 +193,14 @@ int main(int argc, char* argv[]) {
     for (unsigned int i = 0; i < msg_count; i++) {
         if (recv(my_socket, buffer, 2, 0) != 2 || buffer[0] != 'o' || buffer[1] != 'k') {
             fprintf(stderr, "Invalid or no OK response received\n");
-            closesocket(my_socket);
+            s_close(my_socket);
             deinit();
             return 1;
         }
     }
 
     // Close connection
-    closesocket(my_socket);
+    s_close(my_socket);
     deinit();
     return 0;
 }
