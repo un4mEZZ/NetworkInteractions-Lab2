@@ -1,15 +1,15 @@
 # TCP Client
-<span style="color:green">base</span>
-<span style="color:red">dop</span>
+DONE base
+
+dop
 
 # TCP Server
-<span style="color:red">base</span>
-<span style="color:red">dop</span>
+DONE base
 
 # UDP Client
-<span style="color:red">base</span>
-<span style="color:red">dop</span>
+DONE base
+
+dop
 
 # UDP Server
-<span style="color:red">base</span>
-<span style="color:red">dop</span>
+DONE base
