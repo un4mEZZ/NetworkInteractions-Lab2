@@ -1,15 +1,19 @@
+# Issues:
+1) Packet/datagram size (MTU)
+2) Refactoring
+
 # TCP Client
-<span style="color:green">base</span>
-<span style="color:red">dop</span>
+DONE base
+
+dop
 
 # TCP Server
-<span style="color:red">base</span>
-<span style="color:red">dop</span>
+DONE base
 
 # UDP Client
-<span style="color:red">base</span>
-<span style="color:red">dop</span>
+DONE base
 
 # UDP Server
-<span style="color:red">base</span>
-<span style="color:red">dop</span>
+DONE base
+
+DONE dop

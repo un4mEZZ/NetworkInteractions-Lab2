@@ -5,26 +5,41 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #pragma comment(lib, "ws2_32.lib")
-
 #include <stdio.h>
 #include <string.h>
-
 #include <stdlib.h>
+#include <stdbool.h>
 
-int init() {
+// Initialize Winsock 2.2
+int init_wsa() {
     WSADATA wsa_data;
     return (0 == WSAStartup(MAKEWORD(2, 2), &wsa_data));
 }
 
-void deinit() {
+void deinit_wsa() {
     WSACleanup();
 }
 
-int sock_err(const char* function, int s) {
-    int err;
-    err = WSAGetLastError();
-    fprintf(stderr, "%s: socket error: %d\n", function, err);
-    return -1;
+// Garanteed send of len bytes into socket (repeat send() until every byte)
+int send_all(SOCKET sock, const char* buf, int len) {
+    int total_sent = 0;
+    while (total_sent < len) {
+        int sent = send(sock, buf + total_sent, len - total_sent, 0);
+        if (sent <= 0) return -1;
+        total_sent += sent;
+    }
+    return 0;
+}
+
+// Garanteed receive of len bytes from socket (repeat recv() until get needed size)
+int recv_all(SOCKET sock, char* buf, int len) {
+    int total_recv = 0;
+    while (total_recv < len) {
+        int recvd = recv(sock, buf + total_recv, len - total_recv, 0);
+        if (recvd <= 0) return -1;
+        total_recv += recvd;
+    }
+    return 0;
 }
 
 int main(int argc, char* argv[]) {
@@ -32,167 +47,145 @@ int main(int argc, char* argv[]) {
         fprintf(stderr, "Usage: %s <host:port> <filename>\n", argv[0]);
         return 1;
     }
+ 
+    char hostport[256];
+    strncpy(hostport, argv[1], sizeof(hostport) - 1);
+    hostport[sizeof(hostport) - 1] = '\0';
 
-    // Parse host:port
-    char* host = strtok(argv[1], ":");
+    char* host = strtok(hostport, ":");
     char* port = strtok(NULL, ":");
     if (!host || !port) {
         fprintf(stderr, "Invalid host:port format\n");
         return 1;
     }
 
-    // Initialize Winsock
-    if (!init()) {
+    if (!init_wsa()) {
         fprintf(stderr, "WSAStartup failed\n");
         return 1;
     }
 
-    // Create socket
-    int my_socket = socket(AF_INET, SOCK_STREAM, 0);
-    if (my_socket < 0) {
-        sock_err("socket", my_socket);
-        deinit();
+    // Create TCP-socket
+    SOCKET sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock == INVALID_SOCKET) {
+        fprintf(stderr, "Socket creation failed\n");
+        deinit_wsa();
         return 1;
     }
 
+    // Init struct with servre addr
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_port = htons(atoi(port));
     addr.sin_addr.s_addr = inet_addr(host);
 
-    // Connect with retries
+    // Connect to server with 10 attempts (timeout 100 ms)
     int attempts = 0;
-    while (attempts < 10) {
-        if (connect(my_socket, (struct sockaddr*)&addr, sizeof(addr)) == 0) {
-            fprintf(stderr, "Failed to connect\n");
-            // Send initial "put" message
-            const char* init_msg = "put";
-            if (send(my_socket, init_msg, 3, 0) < 0) {
-                fprintf(stderr, "Failed to send initial message\n");
-                closesocket(my_socket);
-                deinit();
-                return 1;
-            }
-            else {
-                printf("PUT sent successfully\n");
-            }
+    bool connected = false;
+    while (!connected && attempts < 10) {
+        if (connect(sock, (struct sockaddr*)&addr, sizeof(addr)) == 0) {
+            connected = true;
+            printf("[CLIENT] Connection success\n");
         }
         else {
             attempts++;
+            printf("[CLIENT] Connection failed, retry %d/10\n", attempts);
             Sleep(100);
-            printf("Trying to reconnect (%d)\n", attempts);
         }
     }
-    if (attempts == 10) {
-        fprintf(stderr, "Failed to connect after 10 attempts\n");
-        closesocket(my_socket);
-        deinit();
-        return 1;
-    }
-//_____________________________________
-    // Open file
-    FILE* file = fopen(argv[2], "r");
-    if (!file) {
-        fprintf(stderr, "Failed to open file %s\n", argv[2]);
-        closesocket(my_socket);
-        deinit();
+    if (!connected) {
+        fprintf(stderr, "[CLIENT] Failed to connect after 10 attempts\n");
+        closesocket(sock);
+        deinit_wsa();
         return 1;
     }
 
-    // Process file
+    // Send "put" to server
+    if (send_all(sock, "put", 3) < 0) {
+        fprintf(stderr, "[CLIENT] Failed to send 'put'\n");
+        closesocket(sock);
+        deinit_wsa();
+        return 1;
+    }
+    printf("[CLIENT] 'put' sent successfully\n");
+
+    FILE* file = fopen(argv[2], "r");
+    if (!file) {
+        fprintf(stderr, "[CLIENT] Failed to open file: %s\n", argv[2]);
+        closesocket(sock);
+        deinit_wsa();
+        return 1;
+    }
+
     char line[1024];
     unsigned int msg_count = 0;
     while (fgets(line, sizeof(line), file)) {
-        // Skip empty lines
-        if (strlen(line) <= 1) continue;
+        if (strlen(line) <= 1) continue;    // Skip empty lines
+        //Sleep(50);                        // Sleep to test poll
 
-        // Parse line
         char date[11], phone[13], message[1000];
         short aa;
+        // Parse line: date, AA, phone, Message
         if (sscanf(line, "%10s %hd %12s %[^\n]", date, &aa, phone, message) != 4) {
-            fprintf(stderr, "Invalid line format: %s", line);
+            fprintf(stderr, "[CLIENT] Invalid line: %s", line);
             continue;
         }
 
-        // Parse date
+        // Date = day, month, year
         unsigned char day, month;
         unsigned short year;
         if (sscanf(date, "%hhu.%hhu.%hu", &day, &month, &year) != 3) {
-            fprintf(stderr, "Invalid date format: %s\n", date);
+            fprintf(stderr, "[CLIENT] Invalid date format: %s\n", date);
             continue;
         }
 
-        // Prepare message
+        // Use network byte order
         unsigned int msg_num = htonl(msg_count);
         unsigned short year_net = htons(year);
         short aa_net = htons(aa);
 
-        if (send(my_socket, (const char*)&msg_num, 4, 0) < 0) {
-            fprintf(stderr, "Failed to send message number\n");
+        // Make a packet to send
+        char sendbuf[2048];
+        int pos = 0;
+
+        memcpy(sendbuf + pos, &msg_num, 4); pos += 4;       // msg num
+        memcpy(sendbuf + pos, &day, 1); pos += 1;           // day
+        memcpy(sendbuf + pos, &month, 1); pos += 1;         // month
+        memcpy(sendbuf + pos, &year_net, 2); pos += 2;      // year
+        memcpy(sendbuf + pos, &aa_net, 2); pos += 2;        // AA
+        memcpy(sendbuf + pos, phone, 12); pos += 12;        // phone
+        size_t mlen = strlen(message);
+        memcpy(sendbuf + pos, message, mlen); pos += mlen;  // Message
+        sendbuf[pos++] = '\0';                              // null term (0x00)
+
+        // Send packet to server
+        if (send_all(sock, sendbuf, pos) < 0) {
+            fprintf(stderr, "[CLIENT] Failed to send message %u\n", msg_count);
             fclose(file);
-            closesocket(my_socket);
-            deinit();
+            closesocket(sock);
+            deinit_wsa();
             return 1;
         }
-
-        // Send date
-        if (send(my_socket, (const char*)&day, 1, 0) < 0 ||
-            send(my_socket, (const char*)&month, 1, 0) < 0 ||
-            send(my_socket, (const char*)&year_net, 2, 0) < 0) {
-            fprintf(stderr, "Failed to send date\n");
-            fclose(file);
-            closesocket(my_socket);
-            deinit();
-            return 1;
-        }
-
-        // Send AA
-        if (send(my_socket, (const char*)&aa_net, 2, 0) < 0) {
-            fprintf(stderr, "Failed to send AA\n");
-            fclose(file);
-            closesocket(my_socket);
-            deinit();
-            return 1;
-        }
-
-        // Send phone
-        if (send(my_socket, phone, 12, 0) < 0) {
-            fprintf(stderr, "Failed to send phone\n");
-            fclose(file);
-            closesocket(my_socket);
-            deinit();
-            return 1;
-        }
-
-        // Send message with null terminator
-        size_t msg_len = strlen(message);
-        if (send(my_socket, message, msg_len, 0) < 0 || send(my_socket, "\0", 1, 0) < 0) {
-            fprintf(stderr, "Failed to send message\n");
-            fclose(file);
-            closesocket(my_socket);
-            deinit();
-            return 1;
-        }
-
+        //printf("[CLIENT] Message %u sent\n", msg_count);
         msg_count++;
     }
 
     fclose(file);
 
-    // Receive OK responses
-    char buffer[2];
+    // Receive "ok" from server (every client)
+    char okbuf[2];
     for (unsigned int i = 0; i < msg_count; i++) {
-        if (recv(my_socket, buffer, 2, 0) != 2 || buffer[0] != 'o' || buffer[1] != 'k') {
-            fprintf(stderr, "Invalid or no OK response received\n");
-            closesocket(my_socket);
-            deinit();
+        if (recv_all(sock, okbuf, 2) < 0 || okbuf[0] != 'o' || okbuf[1] != 'k') {
+            fprintf(stderr, "[CLIENT] Invalid or no OK response received for msg %u\n", i);
+            closesocket(sock);
+            deinit_wsa();
             return 1;
         }
+        //printf("[CLIENT] OK received for msg %u\n", i);
     }
 
-    // Close connection
-    closesocket(my_socket);
-    deinit();
+    printf("[CLIENT] All messages acknowledged, closing connection\n");
+    closesocket(sock);
+    deinit_wsa();
     return 0;
 }
