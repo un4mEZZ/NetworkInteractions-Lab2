@@ -9,6 +9,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdbool.h>
+#include <ctype.h>
 
 // Ethernet MTU и расчёт MSS (не учитываем опции IP/TCP)
 #define ETHERNET_MTU 1500
@@ -46,6 +47,47 @@ int recv_all(SOCKET sock, char* buf, int len) {
         total_recv += recvd;
     }
     return 0;
+}
+
+bool is_digits_only(const char* s) {
+    for (; *s; s++) {
+        if (!isdigit((unsigned char)*s)) return false;
+    }
+    return true;
+}
+
+bool is_printable_string(const char* s) {
+    for (; *s; s++) {
+        if (!isprint((unsigned char)*s)) return false;
+    }
+    return true;
+}
+
+bool validate_line_fields(const char* date, short aa, const char* phone, const char* message) {
+    unsigned char day, month;
+    unsigned short year;
+
+    // Проверка даты
+    if (sscanf(date, "%hhu.%hhu.%hu", &day, &month, &year) != 3) return false;
+    if (day < 1 || day > 31) return false;
+    if (month < 1 || month > 12) return false;
+    if (year < 1000 || year > 9999) return false; // диапазон года
+
+    // Проверка AA — диапазон short
+    if (aa < -32768 || aa > 32767) return false;
+
+    // Проверка телефона: начинается с '+', длина <= 12, остальное — цифры
+    size_t plen = strlen(phone);
+    if (plen < 2 || plen > 12) return false;  // минимум "+X", максимум 12 символов
+    if (phone[0] != '+') return false;
+    if (!is_digits_only(phone + 1)) return false;
+
+    // Проверка текста сообщения
+    size_t mlen = strlen(message);
+    if (mlen == 0) return false; // не пустое
+    if (!is_printable_string(message)) return false; // все символы печатные
+
+    return true;
 }
 
 int main(int argc, char* argv[]) {
@@ -142,8 +184,14 @@ int main(int argc, char* argv[]) {
         char date[11], phone_in[64], message_in[4096];
         short aa;
         // Парсим строку: дата, число AA, телефон, текст сообщения
+        // DOP
         if (sscanf(line, "%10s %hd %63s %[^\n]", date, &aa, phone_in, message_in) != 4) {
-            fprintf(stderr, "[CLIENT] Invalid line: %s", line);
+            fprintf(stderr, "[CLIENT] Invalid line format: %s", line);
+            continue;
+        }
+
+        if (!validate_line_fields(date, aa, phone_in, message_in)) {
+            fprintf(stderr, "[CLIENT] Skipping invalid line: %s", line);
             continue;
         }
 
