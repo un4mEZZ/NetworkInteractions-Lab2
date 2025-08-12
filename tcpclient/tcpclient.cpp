@@ -10,7 +10,13 @@
 #include <stdlib.h>
 #include <stdbool.h>
 
-// Initialize Winsock 2.2
+// Ethernet MTU и расчёт MSS (не учитываем опции IP/TCP)
+#define ETHERNET_MTU 1500
+#define IP_HEADER_LEN 20
+#define TCP_HEADER_LEN 20
+#define MSS (ETHERNET_MTU - IP_HEADER_LEN - TCP_HEADER_LEN) // 1460
+
+// Инициализация библиотеки Winsock 2.2
 int init_wsa() {
     WSADATA wsa_data;
     return (0 == WSAStartup(MAKEWORD(2, 2), &wsa_data));
@@ -20,7 +26,7 @@ void deinit_wsa() {
     WSACleanup();
 }
 
-// Garanteed send of len bytes into socket (repeat send() until every byte)
+// Гарантированная отправка len байт в сокет (повторяем send(), пока всё не уйдёт)
 int send_all(SOCKET sock, const char* buf, int len) {
     int total_sent = 0;
     while (total_sent < len) {
@@ -31,7 +37,7 @@ int send_all(SOCKET sock, const char* buf, int len) {
     return 0;
 }
 
-// Garanteed receive of len bytes from socket (repeat recv() until get needed size)
+// Гарантированное получение len байт из сокета (повторяем recv(), пока не наберём нужный объём)
 int recv_all(SOCKET sock, char* buf, int len) {
     int total_recv = 0;
     while (total_recv < len) {
@@ -47,7 +53,7 @@ int main(int argc, char* argv[]) {
         fprintf(stderr, "Usage: %s <host:port> <filename>\n", argv[0]);
         return 1;
     }
- 
+
     char hostport[256];
     strncpy(hostport, argv[1], sizeof(hostport) - 1);
     hostport[sizeof(hostport) - 1] = '\0';
@@ -64,7 +70,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // Create TCP-socket
+    // Создание TCP-сокета
     SOCKET sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock == INVALID_SOCKET) {
         fprintf(stderr, "Socket creation failed\n");
@@ -72,14 +78,12 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // Init struct with servre addr
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_port = htons(atoi(port));
     addr.sin_addr.s_addr = inet_addr(host);
 
-    // Connect to server with 10 attempts (timeout 100 ms)
     int attempts = 0;
     bool connected = false;
     while (!connected && attempts < 10) {
@@ -100,7 +104,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // Send "put" to server
+    // Отправляем серверу команду "put"
     if (send_all(sock, "put", 3) < 0) {
         fprintf(stderr, "[CLIENT] Failed to send 'put'\n");
         closesocket(sock);
@@ -117,21 +121,32 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    char line[1024];
+    char line[4096];
     unsigned int msg_count = 0;
-    while (fgets(line, sizeof(line), file)) {
-        if (strlen(line) <= 1) continue;    // Skip empty lines
-        //Sleep(50);                        // Sleep to test poll
 
-        char date[11], phone[13], message[1000];
+    // Предвычислим фиксированную длину "заголовочной" части в нашем протоколе:
+    // msg_num (4) + day (1) + month (1) + year (2) + aa (2) + phone (12)
+    const int header_len = 4 + 1 + 1 + 2 + 2 + 12; // = 22
+    if (header_len + 1 > MSS) {
+        fprintf(stderr, "[CLIENT] Protocol header too large for MSS (%d)\n", MSS);
+        fclose(file);
+        closesocket(sock);
+        deinit_wsa();
+        return 1;
+    }
+    const int max_message_bytes = MSS - header_len - 1; // оставить байт для '\0'
+
+    while (fgets(line, sizeof(line), file)) {
+        if (strlen(line) <= 1) continue;    // Пропускаем пустые строки
+
+        char date[11], phone_in[64], message_in[4096];
         short aa;
-        // Parse line: date, AA, phone, Message
-        if (sscanf(line, "%10s %hd %12s %[^\n]", date, &aa, phone, message) != 4) {
+        // Парсим строку: дата, число AA, телефон, текст сообщения
+        if (sscanf(line, "%10s %hd %63s %[^\n]", date, &aa, phone_in, message_in) != 4) {
             fprintf(stderr, "[CLIENT] Invalid line: %s", line);
             continue;
         }
 
-        // Date = day, month, year
         unsigned char day, month;
         unsigned short year;
         if (sscanf(date, "%hhu.%hhu.%hu", &day, &month, &year) != 3) {
@@ -139,26 +154,51 @@ int main(int argc, char* argv[]) {
             continue;
         }
 
-        // Use network byte order
         unsigned int msg_num = htonl(msg_count);
         unsigned short year_net = htons(year);
         short aa_net = htons(aa);
 
-        // Make a packet to send
-        char sendbuf[2048];
+        // Формируем пакет для отправки
+        // Выделяем буфер размером MSS + небольшой запас
+        char sendbuf[MSS + 32];
         int pos = 0;
 
-        memcpy(sendbuf + pos, &msg_num, 4); pos += 4;       // msg num
-        memcpy(sendbuf + pos, &day, 1); pos += 1;           // day
-        memcpy(sendbuf + pos, &month, 1); pos += 1;         // month
-        memcpy(sendbuf + pos, &year_net, 2); pos += 2;      // year
-        memcpy(sendbuf + pos, &aa_net, 2); pos += 2;        // AA
-        memcpy(sendbuf + pos, phone, 12); pos += 12;        // phone
-        size_t mlen = strlen(message);
-        memcpy(sendbuf + pos, message, mlen); pos += mlen;  // Message
-        sendbuf[pos++] = '\0';                              // null term (0x00)
+        memcpy(sendbuf + pos, &msg_num, 4); pos += 4;       // Номер сообщения
+        memcpy(sendbuf + pos, &day, 1); pos += 1;           // День
+        memcpy(sendbuf + pos, &month, 1); pos += 1;         // Месяц
+        memcpy(sendbuf + pos, &year_net, 2); pos += 2;      // Год
+        memcpy(sendbuf + pos, &aa_net, 2); pos += 2;        // Поле AA
 
-        // Send packet to server
+        // Телефон — фиксированное 12 байтное поле. Копируем и дополняем нулями, если короче.
+        char phone_field[12];
+        memset(phone_field, 0, sizeof(phone_field));
+        // Копируем не больше 12 байт
+        strncpy(phone_field, phone_in, sizeof(phone_field));
+        memcpy(sendbuf + pos, phone_field, 12); pos += 12;
+
+        // Оставшееся место для текста сообщения
+        size_t mlen_in = strlen(message_in);
+        size_t mlen_to_send = mlen_in;
+        if ((int)mlen_to_send > max_message_bytes) {
+            mlen_to_send = (size_t)max_message_bytes;
+            // можно сообщить об обрезке
+            printf("[CLIENT] Message %u truncated from %zu to %d bytes to fit MSS\n",
+                msg_count, mlen_in, max_message_bytes);
+        }
+
+        // Копируем часть (или весь) текст сообщения и ставим '\0'
+        memcpy(sendbuf + pos, message_in, mlen_to_send); pos += (int)mlen_to_send;
+        sendbuf[pos++] = '\0';
+
+        // Теперь pos — количество байт для отправки и гарантированно <= MSS
+        if (pos > MSS) {
+            fprintf(stderr, "[CLIENT] Internal error: packet size %d exceeds MSS %d\n", pos, MSS);
+            fclose(file);
+            closesocket(sock);
+            deinit_wsa();
+            return 1;
+        }
+
         if (send_all(sock, sendbuf, pos) < 0) {
             fprintf(stderr, "[CLIENT] Failed to send message %u\n", msg_count);
             fclose(file);
@@ -166,13 +206,12 @@ int main(int argc, char* argv[]) {
             deinit_wsa();
             return 1;
         }
-        //printf("[CLIENT] Message %u sent\n", msg_count);
         msg_count++;
     }
 
     fclose(file);
 
-    // Receive "ok" from server (every client)
+    // Получаем подтверждения "ok" от сервера для каждого отправленного сообщения
     char okbuf[2];
     for (unsigned int i = 0; i < msg_count; i++) {
         if (recv_all(sock, okbuf, 2) < 0 || okbuf[0] != 'o' || okbuf[1] != 'k') {
@@ -181,7 +220,6 @@ int main(int argc, char* argv[]) {
             deinit_wsa();
             return 1;
         }
-        //printf("[CLIENT] OK received for msg %u\n", i);
     }
 
     printf("[CLIENT] All messages acknowledged, closing connection\n");
