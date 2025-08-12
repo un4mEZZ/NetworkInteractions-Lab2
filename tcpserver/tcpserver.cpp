@@ -20,6 +20,7 @@ struct client_info {
     char recv_buffer[BUFFER_SIZE];              // Буфер для накопления входящих данных
     int recv_len;                               // Кол-во данных в буфере
     int put_received;                           // Флаг, что от клиента уже получена команда "put"
+    int get_received;                           // Флаг, что от клиента уже получена команда "get"
 };
 
 
@@ -102,19 +103,65 @@ void remove_client(struct client_info *clients, struct pollfd *pfds, int *count,
 void process_client_buffer(struct client_info *cli, FILE *log_file, int *should_stop) {
     int offset = 0;
     while (offset < cli->recv_len) {
-        // Если ещё не получили "put", проверяем его
-        if (!cli->put_received) {
-            if (cli->recv_len - offset >= 3 && 
-                memcmp(cli->recv_buffer + offset, "put", 3) == 0) {
-                cli->put_received = 1;
-                printf("[SERVER] Received 'put' from %s\n", cli->address_str);
-                offset += 3;
-                continue;
-            } else {
-                break;
+
+        // Если ещё не получили "put" или "get", проверяем их
+        if (!cli->put_received && !cli->get_received) {
+            if (cli->recv_len - offset >= 3) {
+                if (memcmp(cli->recv_buffer + offset, "put", 3) == 0) {
+                    cli->put_received = 1;
+                    printf("[SERVER] Received 'put' from %s\n", cli->address_str);
+                    offset += 3;
+                    continue;
+                } else if (memcmp(cli->recv_buffer + offset, "get", 3) == 0) {
+                    cli->get_received = 1;
+                    printf("[SERVER] Received 'get' from %s\n", cli->address_str);
+                    offset += 3;
+
+                    // отправляем содержимое msg.txt клиенту
+                    FILE *in = fopen("msg.txt", "r");
+                    if (in) {
+                        char line[4096];
+                        unsigned int msg_num = 0;
+                        while (fgets(line, sizeof(line), in)) {
+                            // формат: IP:port dd.mm.yyyy AA phone message
+                            char ipport[64], date[16], phone[32], message[4096];
+                            short aa;
+                            if (sscanf(line, "%63s %15s %hd %31s %[^\n]", ipport, date, &aa, phone, message) == 5) {
+                                unsigned char day, month;
+                                unsigned short year;
+                                if (sscanf(date, "%hhu.%hhu.%hu", &day, &month, &year) != 3) continue;
+
+                                uint32_t num_net = htonl(msg_num++);
+                                unsigned short year_net = htons(year);
+                                short aa_net = htons(aa);
+
+                                send_all(cli->socket, (char*)&num_net, 4);
+                                send_all(cli->socket, (char*)&day, 1);
+                                send_all(cli->socket, (char*)&month, 1);
+                                send_all(cli->socket, (char*)&year_net, 2);
+                                send_all(cli->socket, (char*)&aa_net, 2);
+
+                                char phone_field[12] = {0};
+                                strncpy(phone_field, phone, 12);
+                                send_all(cli->socket, phone_field, 12);
+
+                                send_all(cli->socket, message, strlen(message) + 1);
+                                printf("sent line %d\n", msg_num);
+                            }
+                        }
+                        fclose(in);
+                    }
+
+                    // закрываем соединение после отправки
+                    shutdown(cli->socket, SHUT_RDWR);
+                    return;
+                }
             }
-        } else {
-            
+            break;
+        }
+
+        // Обработка "put"
+        if (cli->put_received) {
             if (cli->recv_len - offset < 4 + 1 + 1 + 2 + 2 + 12 + 1)
                 break;
 
@@ -245,6 +292,7 @@ int main(int argc, char *argv[]) {
                 strcat(clients[client_count].address_str, portbuf);
                 clients[client_count].recv_len = 0;
                 clients[client_count].put_received = 0;
+                clients[client_count].get_received = 0;
                 client_count++;
             } else {
                 close(cfd);
