@@ -1,6 +1,5 @@
 # Issues:
-1) Packet/datagram size (MTU)
-2) Refactoring
+1) TCP DOP 2
 
 # TCP Client
 DONE base
